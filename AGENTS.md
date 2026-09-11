@@ -11,3 +11,10 @@ never connect to or execute on servers. Server work is `[USER — SERVER]` and
 verification evidence is `[USER — RELAY]`.
 
 Read docs/HARDLINKS.md before adding mirrored documentation.
+
+## Shared workflow
+
+Before routing work, read [Shared Repository Workflow](docs/agents/shared-workflow.md)
+for preferences, wiki/GitHub tracking, authorship, and execution boundaries.
+Read [repository tracker settings](docs/agents/issue-tracker.md) for local mappings.
+The shared file is wiki-owned and hardlinked here; see [the link contract](docs/HARDLINKS.md).
