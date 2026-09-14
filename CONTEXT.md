@@ -21,3 +21,8 @@ Scheduling uses a configured positive interval in seconds. Manual replay stays
 available independently of that timer. An optional positive max_runs cap removes
 the oldest recognized completed simulator runs only after successful publication.
 The local deployment enables an hourly Docker scheduler and a ten-run cap.
+
+Every machine supplies its output_root and separate work_root in config. The
+scheduler atomically updates output_root/heartbeat.json, including while copying.
+Liveness and last successful publication are separate UTC timestamps. Manual
+and scheduled publications persist last-success state in the private work root.

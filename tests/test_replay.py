@@ -185,7 +185,7 @@ class ReplayTests(unittest.TestCase):
 
     def test_invalid_cadence_and_limit(self):
         raw = json.loads(self.config_path.read_text())
-        for key in ("run_interval_seconds", "max_runs"):
+        for key in ("run_interval_seconds", "heartbeat_interval_seconds", "max_runs"):
             for value in (0, -1, True, "2", 1.5):
                 with self.subTest(key=key, value=value):
                     self.config_path.write_text(json.dumps({**raw, key: value}))
@@ -225,12 +225,95 @@ class ReplayTests(unittest.TestCase):
             stdout, stderr = process.communicate(timeout=5)
             self.assertEqual(process.returncode, 0, stderr.decode())
             self.assertIn('"scheduler_stopped"', stdout.decode())
-            runs = list(self.config["output_root"].iterdir())
+            runs = list(self.config["output_root"].glob("*/synthetic-run.json"))
             self.assertEqual(len(runs), 2)
             manual = replay(load_config(self.config_path))
             self.assertEqual(manual["status"], "completed")
-            self.assertEqual(len(list(self.config["output_root"].iterdir())), 2)
+            self.assertEqual(len(list(self.config["output_root"].glob("*/synthetic-run.json"))), 2)
             self.assertEqual(len(manual["removed_runs"]), 1)
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.communicate()
+
+    def test_heartbeat_during_idle_manual_replay_failure_and_restart(self):
+        raw = json.loads(self.config_path.read_text())
+        raw.update(heartbeat_interval_seconds=1, run_interval_seconds=3600)
+        self.config_path.write_text(json.dumps(raw))
+        beat_path = self.config["output_root"] / "heartbeat.json"
+
+        def wait_for(process, predicate):
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline:
+                self.assertIsNone(process.poll())
+                if beat_path.exists():
+                    beat = json.loads(beat_path.read_text())
+                    if predicate(beat):
+                        return beat
+                time.sleep(0.05)
+            self.fail("Heartbeat did not reach expected state")
+
+        command = [sys.executable, "-m", "synthetic_sequencer.cli", "--config", str(self.config_path), "schedule"]
+        success = None
+        for restart in (False, True):
+            process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            try:
+                first = wait_for(process, lambda beat: beat["status"] == "running")
+                self.assertEqual(first["last_successful_run"], success)
+                self.assertEqual(beat_path.stat().st_mode & 0o777, 0o640)
+                second = wait_for(process, lambda beat: beat["last_heartbeat"] > first["last_heartbeat"])
+                self.assertEqual(second["last_successful_run"], success)
+                duplicate_config = self.root / "duplicate.json"
+                duplicate_config.write_text(json.dumps({**raw, "directory_mode": "0700"}))
+                mode = self.config["output_root"].stat().st_mode
+                duplicate = subprocess.run([*command[:-2], str(duplicate_config), "schedule"], capture_output=True, timeout=5)
+                self.assertNotEqual(duplicate.returncode, 0)
+                self.assertIn(b"already running", duplicate.stderr)
+                self.assertEqual(self.config["output_root"].stat().st_mode, mode)
+                if not restart:
+                    result = replay(self.config)
+                    completed = wait_for(process, lambda beat: beat["last_successful_run_id"] == result["run_id"])
+                    success = completed["last_successful_run"]
+                    self.assertIsNotNone(success)
+                    with patch("synthetic_sequencer.cli.shutil.copyfile", side_effect=OSError("disk full")):
+                        with self.assertRaises(OSError):
+                            replay(self.config)
+                    failed = wait_for(process, lambda beat: beat["last_heartbeat"] > completed["last_heartbeat"])
+                    self.assertEqual(failed["last_successful_run"], success)
+                process.terminate()
+                _, stderr = process.communicate(timeout=5)
+                self.assertEqual(process.returncode, 0, stderr.decode())
+                self.assertEqual(json.loads(beat_path.read_text())["status"], "stopped")
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                    process.communicate()
+
+    def test_heartbeat_continues_during_slow_scheduled_copy(self):
+        raw = json.loads(self.config_path.read_text())
+        raw.update(heartbeat_interval_seconds=1, run_interval_seconds=1, copy_delay_seconds=2)
+        self.config_path.write_text(json.dumps(raw))
+        process = subprocess.Popen([sys.executable, "-m", "synthetic_sequencer.cli", "--config", str(self.config_path), "schedule"],
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        try:
+            beats = []
+            deadline = time.monotonic() + 12
+            while time.monotonic() < deadline:
+                self.assertIsNone(process.poll())
+                path = self.config["output_root"] / "heartbeat.json"
+                if path.exists():
+                    beat = json.loads(path.read_text())
+                    if beat["last_successful_run"]:
+                        break
+                    if any(self.config["work_root"].rglob("*.fastq.gz")):
+                        beats.append(beat["last_heartbeat"])
+                time.sleep(0.05)
+            else:
+                self.fail("Slow scheduled replay did not complete")
+            self.assertGreaterEqual(len(set(beats)), 2)
+            process.terminate()
+            _, stderr = process.communicate(timeout=8)
+            self.assertEqual(process.returncode, 0, stderr.decode())
         finally:
             if process.poll() is None:
                 process.kill()

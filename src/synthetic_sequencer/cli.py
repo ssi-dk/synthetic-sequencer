@@ -1,6 +1,7 @@
 """A small, dependency-free NextSeq FASTQ replayer (POSIX filesystem)."""
 
 import argparse
+from contextlib import contextmanager
 import csv
 from datetime import datetime, timezone
 import fcntl
@@ -158,7 +159,7 @@ def load_config(path):
     required = {"template", "output_root", "work_root"}
     if required - set(config):
         raise ValueError(f"Missing config keys: {sorted(required - set(config))}")
-    allowed = {"template", "output_root", "work_root", "instrument_id", "directory_mode", "file_mode", "copy_delay_seconds", "run_interval_seconds", "max_runs"}
+    allowed = {"template", "output_root", "work_root", "instrument_id", "directory_mode", "file_mode", "copy_delay_seconds", "run_interval_seconds", "heartbeat_interval_seconds", "max_runs"}
     if set(config) - allowed:
         raise ValueError(f"Unknown config keys: {sorted(set(config) - allowed)}")
     for key in ("template", "output_root", "work_root"):
@@ -179,8 +180,9 @@ def load_config(path):
     if not 0 <= config["copy_delay_seconds"] <= 3600:
         raise ValueError("copy_delay_seconds must be between 0 and 3600")
     config.setdefault("run_interval_seconds", 3600)
+    config.setdefault("heartbeat_interval_seconds", 30)
     config.setdefault("max_runs", None)
-    for key in ("run_interval_seconds", "max_runs"):
+    for key in ("run_interval_seconds", "heartbeat_interval_seconds", "max_runs"):
         if key == "max_runs" and config[key] is None:
             continue
         if type(config[key]) is not int or config[key] < 1:
@@ -226,13 +228,74 @@ def prune_runs(output, max_runs, new_run):
     return removed, []
 
 
-def replay(config):
+def prepare_roots(config):
     output, work = config["output_root"], config["work_root"]
     output.mkdir(parents=True, exist_ok=True)
     work.mkdir(parents=True, exist_ok=True)
     os.chmod(work, 0o700)
     if output.stat().st_dev != work.stat().st_dev:
         raise ValueError("Output and work roots must share a filesystem for atomic publication")
+
+
+def write_json(path, data, mode):
+    """Readers see either the previous complete document or the new one."""
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        with temporary.open("x") as handle:
+            os.fchmod(handle.fileno(), mode)
+            handle.write(json.dumps(data, indent=2) + "\n")
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+@contextmanager
+def heartbeat(config):
+    """A scheduler owns liveness; successful publications have separate state."""
+    prepare_roots(config)
+    with (config["work_root"] / "scheduler.lock").open("a") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise ValueError("A scheduler is already running for this work root") from None
+        os.chmod(config["output_root"], config["directory_mode"])
+        done = threading.Event()
+
+        def update(status):
+            try:
+                success = json.loads((config["work_root"] / "last-successful-run.json").read_text())
+            except FileNotFoundError:
+                success = {}
+            write_json(config["output_root"] / "heartbeat.json", {
+                "sequencer": config["instrument_id"], "status": status,
+                "last_heartbeat": datetime.now(timezone.utc).isoformat(),
+                "heartbeat_interval_seconds": config["heartbeat_interval_seconds"],
+                "last_successful_run": success.get("completed_at"),
+                "last_successful_run_id": success.get("run_id"),
+            }, config["file_mode"])
+
+        def pulse():
+            while not done.wait(config["heartbeat_interval_seconds"]):
+                try:
+                    update("running")
+                except (ValueError, OSError) as error:
+                    print(json.dumps({"status": "heartbeat_failed", "error": str(error)}),
+                          file=sys.stderr, flush=True)
+
+        update("running")
+        worker = threading.Thread(target=pulse, daemon=True)
+        worker.start()
+        try:
+            yield
+        finally:
+            done.set()
+            worker.join()
+            update("stopped")
+
+
+def replay(config):
+    prepare_roots(config)
+    output, work = config["output_root"], config["work_root"]
     with (work / "replay.lock").open("a") as lock:
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -283,6 +346,9 @@ def replay(config):
             os.chmod(staging, config["directory_mode"])
             # No pretend vendor completion flags: the directory becomes visible only when ready.
             staging.rename(destination)
+            write_json(work / "last-successful-run.json", {
+                "run_id": run_id, "completed_at": datetime.now(timezone.utc).isoformat(),
+            }, 0o600)
         except BaseException:
             shutil.rmtree(staging, ignore_errors=True)
             raise
@@ -298,6 +364,11 @@ def replay(config):
 
 
 def schedule(config, stop):
+    with heartbeat(config):
+        run_schedule(config, stop)
+
+
+def run_schedule(config, stop):
     """Fixed interval starts; wait before the first run, skip missed ticks."""
     interval = config["run_interval_seconds"]
     print(json.dumps({"status": "scheduler_started", "run_interval_seconds": interval,

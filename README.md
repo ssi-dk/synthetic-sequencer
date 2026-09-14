@@ -33,6 +33,7 @@ Example configuration; paths are examples, not deployment locations:
   "file_mode": "0640",
   "copy_delay_seconds": 0,
   "run_interval_seconds": 3600,
+  "heartbeat_interval_seconds": 30,
   "max_runs": 10
 }
 ```
@@ -103,6 +104,11 @@ of power-loss durability across all filesystems.
 
 ## Automatic cadence, manual runs, and retention
 
+Each sequencer uses its own config with an explicit `output_root`, `work_root`,
+and `instrument_id`. For multiple sequencers, give each a separate output and
+work root; they may share the same read-only template. Paths are not tied to
+an instrument's vendor default or to Docker volumes.
+
 `run_interval_seconds` is a positive integer cadence in seconds, defaulting to
 3600. Start the long-running scheduler with:
 
@@ -140,6 +146,33 @@ keep the new run and report `retention_failed`, `retention_errors`, and any
 `removed_runs`; manual replay exits 1. The scheduler logs the error and continues
 on the next tick. An unsuccessful cleanup may leave more than the configured
 limit. Successful replay JSON also lists `removed_runs` for auditability.
+
+## Folder heartbeat
+
+The scheduler creates `heartbeat.json` directly in its configured `output_root`
+at startup, then replaces it atomically every `heartbeat_interval_seconds`
+(a positive integer, default 30). It continues updating while idle, validating,
+or copying. The heartbeat uses `file_mode`; users need read/traverse access to
+the output folder. Only one scheduler may run for a work root.
+
+The JSON contains `sequencer`, `status`, `last_heartbeat`,
+`heartbeat_interval_seconds`, `last_successful_run`, and `last_successful_run_id`.
+Timestamps are UTC with an explicit offset. `status: running` means the scheduler
+is alive; inspect the timestamp too. Treat a heartbeat older than three expected
+intervals as stale. SIGTERM/SIGINT produce `status: stopped` after the current run
+finishes. A crash leaves the previous timestamp, which will become stale.
+
+`last_successful_run` is the publication completion time, initially `null`.
+Every successful manual or scheduled replay saves it privately in the work root;
+the next heartbeat reads it, including after a scheduler restart. Failed or
+skipped copies do not advance it. Retention errors still count as successful
+publication because the new run exists. A one-shot replay records success but
+does not start a heartbeat; run `schedule` for ongoing liveness. Existing runs
+from before this feature are not backfilled into the success timestamp.
+
+Consumers should enumerate run directories with `synthetic-run.json`, ignoring
+the root heartbeat file. Keep the work root when restarting or relocating the
+runtime to preserve the run counter and last-success state.
 
 ## Image and permissions
 
