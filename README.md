@@ -21,17 +21,24 @@ For example, set `release` to a reviewed release tag and `arch` to `x86_64` or
 `aarch64` for your Docker engine. Run these commands in an empty directory.
 
 ```sh
+(
+set -e
 archive="synthetic-sequencer-linux-${arch}.tar.gz"
 gh release download "$release" --repo ssi-dk/synthetic-sequencer --pattern "$archive*"
 sha256sum --check "$archive.sha256"
 docker image load --input "$archive"
 image=$(jq -r .image "$archive.manifest.json")
-test "$(docker image inspect --format '{{.Id}}' "$image")" = "$(jq -r .image_id "$archive.manifest.json")"
-docker run --rm --network none "$image" --help
+config_id=$(jq -r .image_id "$archive.manifest.json")
+manifest_id=$(tar -xOzf "$archive" index.json | jq -er '.manifests[0].digest')
+actual=$(docker image inspect --format '{{.Id}}' "$image")
+test "$actual" = "$config_id" || test "$actual" = "$manifest_id" || exit 1
+docker run --rm --pull=never --network none "$image" --help
+)
 ```
 
-For automated deployments, pin the release, archive checksum and expected image
-ID in consumer configuration. A `test-producer-image-*` tag builds and tests
+Docker engines can report the config digest or the OCI manifest digest as the image
+ID. For automated deployments, pin the release, archive checksum and both
+digests in consumer configuration. A `test-producer-image-*` tag builds and tests
 both images on native runners. After testing that prerelease, maintainers can
 run **Release producer image** with its candidate tag to publish the same six
 files under the version in `pyproject.toml`.
